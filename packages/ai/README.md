@@ -24,6 +24,14 @@ for await (const event of ai.llm.stream(ai.llm.request(input))) {
 await ai.dispose()
 ```
 
+A `"provider/model"` string works anywhere a text, image, or decision model does. It loads that provider's default
+model with its env key and no settings, so `"openai/gpt-5.4"` behaves like `OpenAI.model("gpt-5.4")`; the model id is
+everything after the first `/`. `LLM.request` needs a model object, since it builds the request synchronously.
+
+```ts
+await ai.llm.generate({ model: "openai/gpt-5.4", prompt: "Hi" })
+```
+
 The Effect API lives at `@opencode/ai/effect`. Its methods return `Effect` or `Stream`:
 
 ```ts
