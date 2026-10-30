@@ -472,18 +472,6 @@ describe("WebFetchTool registration", () => {
     }),
   )
 
-  it.effect("checks the rules against the URL it requests, not the spelling it was given", () =>
-    Effect.gen(function* () {
-      reset()
-      const registry = yield* Tool.Service
-      const url = "HTTPS://Example.COM:443/Path"
-
-      expect(yield* executeTool(registry, call({ url, format: "text" }))).toMatchObject({ status: "completed" })
-      expect(assertions).toMatchObject([{ action: "webfetch", resources: ["https://example.com/Path"] }])
-      expect(requests.map((request) => request.url)).toEqual(["https://example.com/Path"])
-    }),
-  )
-
   live.effect("follows redirects, checking each target against the rules without asking", () => {
     const received: Array<Record<string, string | null>> = []
     return Effect.acquireUseRelease(

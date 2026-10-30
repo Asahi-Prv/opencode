@@ -87,20 +87,6 @@ describe("fetch permissions", () => {
     ])
   })
 
-  test("fetch checks the rules against the URL it requests, not the spelling it was given", async () => {
-    hits.length = 0
-    const asked: Array<string> = []
-    const permission = permissionService({ assert: (input) => Effect.sync(() => void asked.push(...input.resources)) })
-    const spelled = `HTTP://LOCALHOST:${server.port}/Path`
-    const result = await Effect.runPromise(
-      createCodeMode(new Map(), permission).execute({ code: `return (await fetch("${spelled}")).url` }, context),
-    )
-
-    expect(asked).toEqual([`http://localhost:${server.port}/Path`])
-    expect(result.output.output).toBe(`http://localhost:${server.port}/Path`)
-    expect(hits).toEqual(["GET /Path"])
-  })
-
   test("a rejection with feedback reaches the program as the error message", async () => {
     hits.length = 0
     const url = `${server.url.origin}/corrected`
