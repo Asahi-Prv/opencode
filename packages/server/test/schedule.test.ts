@@ -176,11 +176,40 @@ it.live("ticks due schedules in standalone ServerProcess.start without lifecycle
   }).pipe(Effect.scoped),
 )
 
-it.live("elects one scheduler leader across two server processes sharing a database", () =>
+it.live("elects one scheduler leader when two server processes boot against a due schedule", () =>
   Effect.gen(function* () {
     const dir = (yield* tmpdirScoped("opencode-schedule-leader-")).path
     const dbPath = path.join(dir, "shared.db")
     const marker = path.join(dir, "runs.txt")
+    yield* Effect.promise(() =>
+      fs.writeFile(path.join(dir, "opencode.json"), JSON.stringify({ permission: { shell: "allow" } })),
+    )
+
+    // Seed an active schedule in a short-lived scope so it falls due while no server is running.
+    const createdID = yield* Effect.scoped(
+      Effect.gen(function* () {
+        const handler = yield* ServerFetch.make({
+          app: { version: "test" },
+          database: { path: dbPath },
+          config: { directory: dir, project: true, claude: false },
+          models: { fetch: false },
+          fs: { filewatcher: false },
+        })
+        const seededApi = client(handler)
+        return yield* Effect.promise(async () => {
+          const session = await seededApi.session.create({ location: { directory: dir } })
+          const created = await seededApi.experimental.schedule.create({
+            sessionID: session.id,
+            when: { in: "80 millis" },
+            if: { run: `printf 'x\\n' >> ${JSON.stringify(marker)} && false` },
+            prompt: "single leader check",
+          })
+          return created.id
+        })
+      }),
+    )
+    yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 120)))
+
     const boot = () =>
       ServerProcess.start<never, never>({
         hostname: "127.0.0.1",
@@ -192,8 +221,8 @@ it.live("elects one scheduler leader across two server processes sharing a datab
         fs: { filewatcher: false },
         models: { fetch: false },
       })
-    const first = yield* boot()
-    yield* boot()
+    // Both servers start against the same already-due row at t=0; without leader election both run the check.
+    const [first] = yield* Effect.all([boot(), boot()], { concurrency: 2 })
     const base = `http://127.0.0.1:${"port" in first.address ? first.address.port : 0}`
     const api = OpenCode.make({
       baseUrl: base,
@@ -201,19 +230,11 @@ it.live("elects one scheduler leader across two server processes sharing a datab
     })
 
     yield* Effect.promise(async () => {
-      await fs.writeFile(path.join(dir, "opencode.json"), JSON.stringify({ permission: { shell: "allow" } }))
-      const session = await api.session.create({ location: { directory: dir } })
-      const created = await api.experimental.schedule.create({
-        sessionID: session.id,
-        when: { in: "200 millis" },
-        if: { run: `printf 'x\\n' >> ${JSON.stringify(marker)} && false` },
-        prompt: "single leader check",
-      })
       const deadline = Date.now() + 5_000
-      let current = created
+      let current = await api.experimental.schedule.get({ scheduleID: createdID })
       while (current.status === "active" && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 50))
-        current = await api.experimental.schedule.get({ scheduleID: created.id })
+        current = await api.experimental.schedule.get({ scheduleID: createdID })
       }
       await new Promise((resolve) => setTimeout(resolve, 150))
       const lines = (await fs.readFile(marker, "utf8")).trim().split("\n").filter(Boolean)

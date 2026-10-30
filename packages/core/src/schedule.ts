@@ -2,7 +2,7 @@ export * as Schedule from "./schedule.js"
 
 import { randomUUID } from "node:crypto"
 import { and, asc, eq, gt, isNull, lte, min, or, sql } from "drizzle-orm"
-import { Cause, Clock, Context, Cron, DateTime, Effect, Latch, Layer, Option, Result, Schema } from "effect"
+import { Cause, Clock, Context, Cron, DateTime, Effect, Latch, Layer, Option, Result, Schedule as EffectSchedule, Schema } from "effect"
 import { Node, makeGlobalNode } from "@opencode/util/effect/app-node"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import {
@@ -447,6 +447,7 @@ const layer = Layer.effect(
     const step = Effect.fnUntraced(function* (row: Row, now: number) {
       const due = row.next_due_at
       if (due === null || row.session_id === null) return
+      if (!(yield* claimLeader(yield* Clock.currentTimeMillis))) return
       const session = yield* sessions.get(row.session_id)
       if (!(yield* settings(session)).enabled) {
         // Reading the flag boots the Session's location, so check again in an hour rather than every tick. The row
@@ -574,6 +575,12 @@ const layer = Layer.effect(
       ),
     )
 
+    const heartbeat = Clock.currentTimeMillis.pipe(
+      Effect.flatMap(claimLeader),
+      Effect.ignore,
+      Effect.schedule(EffectSchedule.spaced(LEADER_TTL / 3)),
+    )
+
     const loop = Effect.gen(function* () {
       yield* doorbell.close
       const now = yield* Clock.currentTimeMillis
@@ -587,7 +594,13 @@ const layer = Layer.effect(
         leading = true
         yield* rewake.pipe(Effect.catchCause((cause) => Effect.logError("schedule rewake failed", { cause })))
       }
-      yield* tickAt(now).pipe(Effect.catchCause((cause) => Effect.logError("schedule tick failed", { cause })))
+      yield* Effect.scoped(
+        Effect.forkScoped(heartbeat).pipe(
+          Effect.andThen(
+            tickAt(now).pipe(Effect.catchCause((cause) => Effect.logError("schedule tick failed", { cause }))),
+          ),
+        ),
+      )
       const wait = yield* nextWake(now)
       if (wait > 0) yield* doorbell.await.pipe(Effect.timeoutOption(wait))
     })
