@@ -43,7 +43,7 @@ export function locationErrors<A, E, R>(effect: Effect.Effect<A, E, R>) {
               location: { directory: defect.directory },
               message:
                 process.platform === "darwin"
-                  ? `Location access denied: ${defect.directory}. If macOS privacy settings block it, allow access in System Settings > Privacy & Security > Files & Folders.`
+                  ? `Location access denied: ${defect.directory}. Check System Settings > Privacy & Security > Files & Folders.`
                   : `Location access denied: ${defect.directory}`,
             }),
           )
