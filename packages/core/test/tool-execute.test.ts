@@ -20,7 +20,7 @@ const context = {
   progress: () => Effect.void,
 }
 
-const allowAll = permissionService({ assert: () => Effect.void })
+const allowAll = permissionService({ assert: () => Effect.void, assertNotDenied: () => Effect.void })
 
 const createCodeMode = (tools: ReadonlyMap<string, Info>, permission = allowAll) =>
   CodeModeTool.create({ tools }, (_, tool, input, context) => execute(tool, input, context), permission)
@@ -54,8 +54,13 @@ describe("fetch permissions", () => {
     server = Bun.serve({
       port: 0,
       fetch: (request) => {
-        hits.push(`${request.method} ${new URL(request.url).pathname}`)
-        return new Response("ok")
+        const url = new URL(request.url)
+        hits.push(`${request.method} ${url.host === server.url.host ? "" : "other "}${url.pathname}`)
+        // /redirect/<status>?to=<url> answers with that redirect.
+        const redirect = url.pathname.match(/^\/redirect\/(\d+)$/)
+        if (redirect)
+          return new Response(null, { status: Number(redirect[1]), headers: { location: url.searchParams.get("to")! } })
+        return new Response(`${request.method} ${request.headers.get("authorization") ?? "no auth"}`)
       },
     })
   })
@@ -72,7 +77,7 @@ describe("fetch permissions", () => {
       ).execute({ code: `return await (await fetch("${url}", { method: "POST" })).text()` }, context),
     )
 
-    expect(result.output.output).toBe("ok")
+    expect(result.output.output).toBe("POST no auth")
     expect(hits).toEqual(["POST /allowed"])
     expect(asked).toEqual([
       {
@@ -85,6 +90,56 @@ describe("fetch permissions", () => {
         source: { type: "tool", messageID: context.messageID, id: context.id },
       },
     ])
+  })
+
+  test("each redirect hop is checked against the webfetch deny rules before it is requested", async () => {
+    hits.length = 0
+    const target = `${server.url.origin}/blocked`
+    const checked: Array<string> = []
+    const permission = permissionService({
+      assert: () => Effect.void,
+      assertNotDenied: (input) =>
+        Effect.sync(() => void checked.push(...input.resources)).pipe(
+          Effect.andThen(
+            input.resources.includes(target)
+              ? Effect.fail(
+                  new Permission.BlockedError({ rules: [], permission: input.action, resources: input.resources }),
+                )
+              : Effect.void,
+          ),
+        ),
+    })
+    const url = `${server.url.origin}/redirect/302?to=${encodeURIComponent(target)}`
+    const result = await Effect.runPromise(
+      createCodeMode(new Map(), permission).execute(
+        { code: `const [r] = await Promise.allSettled([fetch("${url}")]); return r.status` },
+        context,
+      ),
+    )
+
+    expect(result.output.output).toBe("rejected")
+    expect(checked).toEqual([target])
+    expect(hits).toEqual(["GET /redirect/302"])
+  })
+
+  test("allowed redirects are followed like a browser: 303 turns a POST into a GET, credentials stay on their origin", async () => {
+    hits.length = 0
+    // 127.0.0.1 is a different origin from the server's own localhost URL.
+    const other = `http://127.0.0.1:${server.port}/final`
+    const hop = `${server.url.origin}/redirect/302?to=${encodeURIComponent(other)}`
+    const url = `${server.url.origin}/redirect/303?to=${encodeURIComponent(hop)}`
+    const result = await Effect.runPromise(
+      createCodeMode(new Map()).execute(
+        {
+          code: `const r = await fetch("${url}", { method: "POST", body: "x", headers: { authorization: "secret" } })
+return [r.url, r.redirected, await r.text()]`,
+        },
+        context,
+      ),
+    )
+
+    expect(JSON.parse(result.output.output)).toEqual([other, true, "GET no auth"])
+    expect(hits).toEqual(["POST /redirect/303", "GET /redirect/302", "GET other /final"])
   })
 
   test("a rejection with feedback reaches the program as the error message", async () => {
