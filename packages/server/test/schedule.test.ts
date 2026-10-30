@@ -6,6 +6,7 @@ import { Effect } from "effect"
 import { tmpdirScoped } from "../../core/test/fixture/tmpdir"
 import { it } from "../../core/test/lib/effect"
 import { ServerFetch } from "../src/fetch"
+import { startServer } from "./fixture/server"
 
 const client = (handler: (request: Request) => Promise<Response>) =>
   OpenCode.make({
@@ -15,7 +16,7 @@ const client = (handler: (request: Request) => Promise<Response>) =>
     }),
   })
 
-it.live("manages schedules through the experimental API where the session's config enables them", () =>
+it.live("manages schedules by default through the experimental API and honors experimental.schedules: false", () =>
   Effect.gen(function* () {
     const dir = (yield* tmpdirScoped("opencode-schedule-api-")).path
     const global = path.join(dir, "global")
@@ -23,7 +24,7 @@ it.live("manages schedules through the experimental API where the session's conf
     const disabled = path.join(dir, "disabled")
     yield* Effect.promise(async () => {
       await Promise.all([global, enabled, disabled].map((item) => fs.mkdir(item, { recursive: true })))
-      await fs.writeFile(path.join(enabled, "opencode.json"), JSON.stringify({ experimental: { schedules: true } }))
+      await fs.writeFile(path.join(disabled, "opencode.json"), JSON.stringify({ experimental: { schedules: false } }))
     })
     const handler = yield* ServerFetch.make({
       app: { version: "test" },
@@ -139,6 +140,36 @@ it.live("manages schedules through the experimental API where the session's conf
         prompt: "ping",
       })
       expect(mixed.status).toBe(400)
+    })
+  }).pipe(Effect.scoped),
+)
+
+it.live("ticks due schedules in standalone ServerProcess.start without lifecycle", () =>
+  Effect.gen(function* () {
+    const dir = (yield* tmpdirScoped("opencode-schedule-serve-")).path
+    const server = yield* startServer(dir)
+    const api = OpenCode.make({ baseUrl: server.base, headers: server.headers })
+
+    yield* Effect.promise(async () => {
+      const session = await api.session.create({ location: { directory: dir } })
+      const created = await api.experimental.schedule.create({
+        sessionID: session.id,
+        when: { in: "150 millis" },
+        prompt: "wake from serve",
+      })
+      expect(created.status).toBe("active")
+
+      const deadline = Date.now() + 5_000
+      let current = created
+      while (current.status === "active" && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        current = await api.experimental.schedule.get({ scheduleID: created.id })
+      }
+      expect(current).toMatchObject({
+        status: "done",
+        runCount: 1,
+        lastOutcome: "fired",
+      })
     })
   }).pipe(Effect.scoped),
 )

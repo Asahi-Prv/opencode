@@ -76,11 +76,19 @@ const enabledEntries = [
     type: "document",
     info: new Info({
       timezone: "America/New_York",
-      experimental: new ConfigExperimental.Info({ schedules: true }),
+    }),
+  }),
+]
+const disabledEntries = [
+  new Document({
+    type: "document",
+    info: new Info({
+      experimental: new ConfigExperimental.Info({ schedules: false }),
     }),
   }),
 ]
 const enabled = Config.testLayer(enabledEntries)
+const disabled = Config.testLayer(disabledEntries)
 /** A location whose flag the test turns on, counting every config read. */
 const toggle = { on: false, reads: 0 }
 const toggled = Layer.succeed(
@@ -89,7 +97,7 @@ const toggled = Layer.succeed(
     entries: () =>
       Effect.sync(() => {
         toggle.reads++
-        return toggle.on ? enabledEntries : []
+        return toggle.on ? enabledEntries : disabledEntries
       }),
     changes: () => Stream.empty,
   }),
@@ -224,7 +232,7 @@ const locations = makeGlobalNode({
               ? enabled
               : ref.directory === toggleDirectory
                 ? toggled
-                : Layer.empty,
+                : disabled,
             configureAgent.pipe(
               Layer.provideMerge(
                 LayerNode.compile(
