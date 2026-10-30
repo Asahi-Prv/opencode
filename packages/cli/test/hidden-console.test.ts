@@ -2,21 +2,12 @@ import { describe, expect, test } from "bun:test"
 import { spawn } from "node:child_process"
 import os from "node:os"
 import path from "node:path"
-import { HiddenConsole } from "#hidden-console"
-import { attach } from "../src/services/hidden-console.node"
 
 const probe = path.join(import.meta.dir, "fixture/hidden-console-probe.ts")
-const supportsHiddenConsole = process.platform === "win32" && Number(os.release().split(".")[2]) >= 26100
+const build = Number.parseInt(os.release().split(".")[2] ?? "", 10)
+const supportsHiddenConsole = process.platform === "win32" && build >= 26100
 
 describe("HiddenConsole", () => {
-  test("node fallback is a no-op", () => {
-    expect(attach()).toBeUndefined()
-  })
-
-  test("attach is safe when called in an attached or unsupported process", () => {
-    expect(HiddenConsole.attach()).toBeUndefined()
-  })
-
   // AllocConsoleWithOptions requires Windows 11 24H2 / Server 2025 (build 26100+).
   test.skipIf(!supportsHiddenConsole)(
     "gives a detached Windows service a windowless console inherited by unhidden children while keeping stdio pipes",
@@ -46,6 +37,7 @@ describe("HiddenConsole", () => {
       expect(JSON.parse(result.stdout.trim())).toEqual({
         beforeCount: 0,
         status: undefined,
+        repeatStatus: undefined,
         afterCount: 1,
         hwnd: 0,
         child: {

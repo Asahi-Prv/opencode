@@ -1,4 +1,4 @@
-import { dlopen, ptr } from "bun:ffi"
+import { dlopen } from "bun:ffi"
 import { HiddenConsole } from "../../src/services/hidden-console.bun"
 
 const kernel32 = dlopen("kernel32.dll", {
@@ -10,7 +10,7 @@ const mode = process.argv[2]
 
 if (mode === "child") {
   const pids = new Uint32Array(8)
-  const count = kernel32.symbols.GetConsoleProcessList(ptr(pids), 8)
+  const count = kernel32.symbols.GetConsoleProcessList(pids, 8)
   const hwnd = Number(kernel32.symbols.GetConsoleWindow())
   kernel32.close()
   process.stdout.write(JSON.stringify({ count, hwnd }) + "\n")
@@ -18,10 +18,12 @@ if (mode === "child") {
 }
 
 const before = new Uint32Array(8)
-const beforeCount = kernel32.symbols.GetConsoleProcessList(ptr(before), 8)
+const beforeCount = kernel32.symbols.GetConsoleProcessList(before, 8)
 const status = HiddenConsole.attach()
+// A second call sees the attached console and returns without replacing it.
+const repeatStatus = HiddenConsole.attach()
 const after = new Uint32Array(8)
-const afterCount = kernel32.symbols.GetConsoleProcessList(ptr(after), 8)
+const afterCount = kernel32.symbols.GetConsoleProcessList(after, 8)
 const hwnd = Number(kernel32.symbols.GetConsoleWindow())
 kernel32.close()
 
@@ -46,6 +48,7 @@ process.stdout.write(
   JSON.stringify({
     beforeCount,
     status,
+    repeatStatus,
     afterCount,
     hwnd,
     child: JSON.parse(childStdout.trim()),

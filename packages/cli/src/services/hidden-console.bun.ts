@@ -1,6 +1,6 @@
 export * as HiddenConsole from "./hidden-console.bun"
 
-import { dlopen, ptr } from "bun:ffi"
+import { dlopen } from "bun:ffi"
 import os from "node:os"
 
 // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
@@ -17,7 +17,8 @@ const invalidHandle = -1n
 export function attach(): number | undefined {
   if (process.platform !== "win32") return undefined
   // AllocConsoleWithOptions requires Windows 11 24H2 / Server 2025 (build 26100).
-  if (Number(os.release().split(".")[2]) < 26100) return undefined
+  const build = Number.parseInt(os.release().split(".")[2] ?? "", 10)
+  if (!(build >= 26100)) return undefined
   const kernel32 = dlopen("kernel32.dll", {
     AllocConsoleWithOptions: { args: ["ptr", "ptr"], returns: "i32" },
     GetConsoleProcessList: { args: ["ptr", "u32"], returns: "u32" },
@@ -27,15 +28,17 @@ export function attach(): number | undefined {
   try {
     // Keep an inherited console untouched when `serve --service` runs interactively in a terminal.
     const attached = new Uint32Array(1)
-    if (kernel32.symbols.GetConsoleProcessList(ptr(attached), 1) > 0) return undefined
+    if (kernel32.symbols.GetConsoleProcessList(attached, 1) > 0) return undefined
     // Allocation points the standard handles at the new console; keep the pipes the spawner reads.
     const handles = standardHandles.map((id) => [id, kernel32.symbols.GetStdHandle(id)] as const)
     // ALLOC_CONSOLE_OPTIONS { mode: ALLOC_CONSOLE_MODE_NO_WINDOW (2), useShowWindow: FALSE (0), showWindow: 0 }
-    const status = kernel32.symbols.AllocConsoleWithOptions(ptr(new Int32Array([2, 0, 0])), null)
+    const options = new Int32Array([2, 0, 0])
+    const status = kernel32.symbols.AllocConsoleWithOptions(options, null)
+    if (status !== 0) return status
     handles.forEach(([id, handle]) => {
       if (handle !== invalidHandle) kernel32.symbols.SetStdHandle(id, handle)
     })
-    return status === 0 ? undefined : status
+    return undefined
   } finally {
     kernel32.close()
   }
