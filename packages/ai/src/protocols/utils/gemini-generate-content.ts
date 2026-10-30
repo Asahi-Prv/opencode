@@ -150,4 +150,13 @@ export const mediaPart = (
   )
 }
 
+export const SKIP_THOUGHT_SIGNATURE_VALIDATOR = "skip_thought_signature_validator"
+
+export const requiresThoughtSignatureFallback = (modelID: string) => {
+  if (!/(^|\/)gemini-/i.test(modelID)) return false
+  if (/(^|\/)gemini-(?:1|2)(?:[.-]|$)/i.test(modelID)) return false
+  if (/(^|\/)gemini-pro(?:-vision)?$/i.test(modelID)) return false
+  return !/(^|\/)gemini-robotics-er-1\.5(?:[.-]|$)/i.test(modelID)
+}
+
 export * as GeminiGenerateContent from "./gemini-generate-content.js"
