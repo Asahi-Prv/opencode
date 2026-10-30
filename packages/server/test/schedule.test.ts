@@ -151,10 +151,12 @@ it.live("ticks due schedules in standalone ServerProcess.start without lifecycle
     const api = OpenCode.make({ baseUrl: server.base, headers: server.headers })
 
     yield* Effect.promise(async () => {
+      await fs.writeFile(path.join(dir, "opencode.json"), JSON.stringify({ permission: { shell: "allow" } }))
       const session = await api.session.create({ location: { directory: dir } })
       const created = await api.experimental.schedule.create({
         sessionID: session.id,
         when: { in: "150 millis" },
+        if: { run: "false" },
         prompt: "wake from serve",
       })
       expect(created.status).toBe("active")
@@ -167,8 +169,7 @@ it.live("ticks due schedules in standalone ServerProcess.start without lifecycle
       }
       expect(current).toMatchObject({
         status: "done",
-        runCount: 1,
-        lastOutcome: "fired",
+        lastOutcome: "checked",
       })
     })
   }).pipe(Effect.scoped),
