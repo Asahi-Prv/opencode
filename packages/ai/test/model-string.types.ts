@@ -5,7 +5,7 @@ import { OpenAI } from "../src/providers.js"
 const ids = ["openai/gpt-5.4-nano", "anthropic/claude-haiku-4-5"] as const
 declare const configured: string
 
-LLM.generate({ model: "openai/gpt-5.4", prompt: "Hi", providerOptions: { openai: { store: false } } })
+LLM.generate({ model: "openai/gpt-5.4", prompt: "Hi", providerOptions: { store: false } })
 LLM.stream({ model: configured, prompt: "Hi" })
 LLM.loop({ model: ids[0], prompt: "Hi", tools: {} })
 void Promise.all(ids.map((model) => ai.llm.generate({ model, prompt: "Hi" })))
