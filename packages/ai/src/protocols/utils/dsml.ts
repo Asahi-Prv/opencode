@@ -50,8 +50,8 @@ export interface State {
   readonly held: string
   /** Open markup region: a wrapped block or a standalone invoke, opener included. */
   readonly markup?: { readonly kind: "block" | "invoke"; readonly text: string }
-  /** Stream-local counter for recovered tool call ids. */
-  readonly nextId: number
+  /** Number of tool calls recovered in this stream. */
+  readonly recovered: number
 }
 
 export interface Output {
@@ -60,7 +60,13 @@ export interface Output {
   readonly events: ReadonlyArray<LLMEvent>
 }
 
-export const initial = (): State => ({ held: "", nextId: 0 })
+export const initial = (): State => ({ held: "", recovered: 0 })
+
+/**
+ * Recovered calls replay in session history across turns, so they need
+ * globally unique ids rather than a per-stream counter.
+ */
+const callId = () => `tool_${crypto.randomUUID().replaceAll("-", "")}`
 
 /**
  * Consume one content delta. Returns the text that may be published (markup
@@ -71,7 +77,7 @@ export const initial = (): State => ({ held: "", nextId: 0 })
 export const push = (state: State, text: string): [State, Output] => {
   const events: LLMEvent[] = []
   let out = ""
-  let nextId = state.nextId
+  let recovered = state.recovered
   let pending = (state.markup?.text ?? state.held) + text
   let kind: "block" | "invoke" | undefined = state.markup?.kind
   while (true) {
@@ -80,9 +86,9 @@ export const push = (state: State, text: string): [State, Output] => {
       if (!closer) break
       // A standalone invoke region needs its own closer inside the payload for
       // the span regex to match; a wrapper closer is inert there.
-      const recovered = recover(pending.slice(0, closer.index + closer[0].length), nextId)
-      nextId += recovered.count
-      events.push(...recovered.events)
+      const found = recover(pending.slice(0, closer.index + closer[0].length))
+      recovered += found.count
+      events.push(...found.events)
       pending = pending.slice(closer.index + closer[0].length)
       kind = undefined
       continue
@@ -105,7 +111,7 @@ export const push = (state: State, text: string): [State, Output] => {
     {
       held: kind === undefined ? pending : "",
       markup: kind === undefined ? undefined : { kind, text: pending },
-      nextId,
+      recovered,
     },
     { text: out === "" ? undefined : out, events },
   ]
@@ -113,23 +119,27 @@ export const push = (state: State, text: string): [State, Output] => {
 
 /**
  * Flush at end of stream: recover complete invokes from a truncated markup
- * region and drop the rest. A partial tag or truncated call is protocol noise,
- * and republishing it would only teach the model to repeat the leak.
+ * region and drop the rest — a partial tag or truncated call is protocol
+ * noise, and republishing it would only teach the model to repeat the leak.
+ * Without an open region the withheld tail is ordinary text that merely could
+ * have started a tag, so it is published instead.
  */
 export const flush = (state: State): [State, Output] => {
-  const held = state.markup?.text ?? state.held
-  if (held === "") return [state, { events: [] }]
-  const recovered = recover(held, state.nextId)
-  return [{ held: "", nextId: state.nextId + recovered.count }, { events: recovered.events }]
+  if (state.markup !== undefined) {
+    const found = recover(state.markup.text)
+    return [{ held: "", recovered: state.recovered + found.count }, { events: found.events }]
+  }
+  if (/[｜|]DSML[｜|]/.test(state.held)) return [state, { events: [] }]
+  return [state, { events: [], text: state.held === "" ? undefined : state.held }]
 }
 
-const recover = (text: string, nextId: number): { events: LLMEvent[]; count: number } => {
+const recover = (text: string): { events: LLMEvent[]; count: number } => {
   const events: LLMEvent[] = []
   let count = 0
   for (const match of text.matchAll(INVOKE)) {
     const name = match[1]?.trim()
     if (!name) continue
-    events.push(...toolEvents(`dsml_${nextId + count}`, name, match[2] ?? ""))
+    events.push(...toolEvents(callId(), name, match[2] ?? ""))
     count++
   }
   return { events, count }

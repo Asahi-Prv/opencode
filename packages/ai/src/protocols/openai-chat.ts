@@ -1349,12 +1349,13 @@ export const finishEvents = Effect.fnUntraced(function* (state: ParserState) {
       ? (yield* finishTools(state.tools, state.customCalls)).events
       : state.toolCallEvents
   // Recovered invokes flush at stream end: complete calls inside a truncated
-  // block still execute, leftover markup noise is dropped.
+  // block still execute, leftover markup noise is dropped, and the withheld
+  // idle tail is ordinary text that gets published.
   const flushed = state.recovery === undefined ? undefined : DSML.flush(state.recovery)
   const recoveredEvents = flushed?.[1].events ?? []
   // Recovered calls upgrade a "stop" finish even though the provider never
   // reported tool calls itself.
-  const hasToolCalls = toolCallEvents.length > 0 || (state.recovery?.nextId ?? 0) > 0
+  const hasToolCalls = toolCallEvents.length > 0 || (flushed?.[0].recovered ?? 0) > 0
   const reason = state.finishReason
     ? {
         ...state.finishReason,
@@ -1378,7 +1379,10 @@ export const finishEvents = Effect.fnUntraced(function* (state: ParserState) {
           reasoningMetadata(state.providerMetadataKey, state.reasoningField),
         )
       : state.lifecycle
-  const ended = Lifecycle.reasoningEnd(started, events, "reasoning-0", metadata)
+  // Text withheld by recovery's tag-prefix holdback is published before the step closes.
+  const text = flushed?.[1].text
+  const published = text === undefined ? started : Lifecycle.textDelta(started, events, "text-0", text)
+  const ended = Lifecycle.reasoningEnd(published, events, "reasoning-0", metadata)
   const lifecycle = toolCallEvents.length || recoveredEvents.length > 0 ? Lifecycle.stepStart(ended, events) : ended
   events.push(...recoveredEvents, ...toolCallEvents)
   Lifecycle.finish(lifecycle, events, { reason, usage: state.usage })

@@ -163,8 +163,45 @@ describe("OpenAI Chat DSML recovery", () => {
       )
 
       const calls = toolCalls(response.events)
-      expect(calls.map((call) => call.id)).toEqual(["dsml_0", "dsml_1"])
+      expect(calls.map((call) => call.id)).toHaveLength(2)
+      expect(calls[0].id).not.toBe(calls[1].id)
       expect(calls.map((call) => call.input)).toEqual([{ command: "ls" }, { command: "pwd" }])
+    }),
+  )
+
+  it.effect("does not reuse recovered call ids across responses", () =>
+    Effect.gen(function* () {
+      const first = yield* generate(deepseek, deltaChunk({ content: V41_BLOCK }), deltaChunk({}, "stop"))
+      const second = yield* generate(deepseek, deltaChunk({ content: V41_BLOCK }), deltaChunk({}, "stop"))
+
+      expect(toolCalls(first.events)[0].id).toMatch(/^tool_[0-9a-f]{32}$/)
+      expect(toolCalls(first.events)[0].id).not.toBe(toolCalls(second.events)[0].id)
+    }),
+  )
+
+  it.effect("upgrades the finish reason for calls recovered at end of stream", () =>
+    Effect.gen(function* () {
+      const response = yield* generate(
+        deepseek,
+        deltaChunk({
+          content: `<｜DSML｜ calls><｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="command" string="true">ls</｜DSML｜ parameter></｜DSML｜ invoke>`,
+        }),
+        deltaChunk({}, "stop"),
+      )
+
+      const calls = toolCalls(response.events)
+      expect(calls).toHaveLength(1)
+      expect(calls[0].input).toEqual({ command: "ls" })
+      expect(response.finishReason).toEqual({ normalized: "tool-calls", raw: "stop" })
+    }),
+  )
+
+  it.effect("publishes text withheld by the tag-prefix holdback at end of stream", () =>
+    Effect.gen(function* () {
+      const response = yield* generate(deepseek, deltaChunk({ content: "compare 1 <" }), deltaChunk({}, "stop"))
+
+      expect(response.text).toBe("compare 1 <")
+      expect(toolCalls(response.events)).toHaveLength(0)
     }),
   )
 
