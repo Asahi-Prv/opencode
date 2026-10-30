@@ -11,8 +11,9 @@ import type {
   Namespace as ToolNamespace,
   Result,
 } from "@opencode/schema/tool"
-import { Clock, Context, Effect, Ref, Schema, Semaphore } from "effect"
+import { Clock, Context, Deferred, Effect, Exit, Fiber, Ref, Schema, Semaphore } from "effect"
 import { toSessionError } from "../session/to-session-error.js"
+import { ToolPartial } from "../tool/partial.js"
 import { definition, normalizedName } from "../tool/runtime.js"
 import { CodeModeCatalog } from "./catalog.js"
 import { CodeModeWeb } from "./web.js"
@@ -115,8 +116,14 @@ export const create = (
               yield* Effect.sleep(wait).pipe(Effect.andThen(lock.withPermit(publish)), Effect.forkIn(scope))
             }),
           )
-        const result = yield* runtime(inventory)
-          .execute(code)
+        // A failed or interrupted call keeps its last progress, so send pending rows before it settles.
+        const flush = lock.withPermit(
+          Ref.get(trailing).pipe(Effect.flatMap((pending) => (pending ? publish : Effect.void))),
+        )
+        const stop = yield* Deferred.make<void>()
+        const interrupted = new Set<number>()
+        const execution = yield* runtime(inventory)
+          .execute(code, { stop: Deferred.await(stop) })
           .pipe(
             Effect.provideService(Run, {
               executeTool: (name, tool, input) =>
@@ -132,13 +139,28 @@ export const create = (
                     yield* Ref.update(files, (items) => [...items, { index, files: outputFileParts }])
                   return resultValue(executed)
                 }),
-              hooks: progressHooks(record),
+              hooks: progressHooks(record, interrupted),
             }),
-            // A failed or interrupted call keeps its last progress, so send pending rows before it settles.
-            Effect.onError(() =>
-              lock.withPermit(Ref.get(trailing).pipe(Effect.flatMap((pending) => (pending ? publish : Effect.void)))),
-            ),
+            Effect.onError(() => flush),
+            Effect.forkIn(scope),
           )
+        // Interrupting this call stops the program, which reports what it did; that becomes the failure's content.
+        const exit = yield* Fiber.await(execution).pipe(
+          Effect.onInterrupt(() =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(stop, undefined)
+              const stopped = yield* Fiber.await(execution)
+              yield* flush
+              if (Exit.isFailure(stopped)) return
+              const rows = (yield* Ref.get(calls)).map(
+                (call, index) => `- ${call.tool}: ${interrupted.has(index) ? "interrupted" : call.status}`,
+              )
+              const text = [formatResult(stopped.value), rows.length > 0 ? `Tool calls:\n${rows.join("\n")}` : ""]
+              yield* ToolPartial.record([{ type: "text", text: text.filter((part) => part !== "").join("\n\n") }])
+            }),
+          ),
+        )
+        const result = yield* exit
         const toolCalls = yield* Ref.get(calls)
         const collected = (yield* Ref.get(files))
           .toSorted((left, right) => left.index - right.index)
@@ -173,7 +195,10 @@ export const create = (
 }
 
 // Rows appear in start order; the same call object arrives at both hooks, so a call finds its row again.
-function progressHooks(record: (update: (items: Array<ExecuteCall>) => Array<ExecuteCall>) => Effect.Effect<unknown>) {
+function progressHooks(
+  record: (update: (items: Array<ExecuteCall>) => Array<ExecuteCall>) => Effect.Effect<unknown>,
+  interrupted: Set<number>,
+) {
   const rows = new WeakMap<object, number>()
   const start = (call: object, entry: ExecuteCall) =>
     record((items) => {
@@ -183,6 +208,7 @@ function progressHooks(record: (update: (items: Array<ExecuteCall>) => Array<Exe
   const settle = (call: object, result: CodeMode.CallResult) => {
     const index = rows.get(call)
     if (index === undefined) return Effect.void
+    if (result.status === "interrupted") interrupted.add(index)
     return record((items) => {
       const next = [...items]
       next[index] = { ...items[index], status: result.status === "success" ? "completed" : "error" }
@@ -279,7 +305,7 @@ export const check = (
   executeTool: (name: string, tool: Info, input: unknown) => Effect.Effect<Result, Error>,
 ) =>
   CodeMode.make({ tools: inventoryTools(inventory), hooks: runHooks, limits })
-    .execute(code, bindings)
+    .execute(code, { bindings })
     .pipe(
       Effect.provideService(Run, {
         executeTool: (name, tool, input) => executeTool(name, tool, input).pipe(Effect.map(resultValue)),

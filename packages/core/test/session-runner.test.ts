@@ -1615,7 +1615,10 @@ describe("SessionRunnerLLM", () => {
         }),
       )
       yield* s.admit("Echo before moving")
-      yield* s.llm.push(TestLLM.toolCall("call-move", "echo", { text: "moving" }), TestLLM.text("Done", "text-after-move"))
+      yield* s.llm.push(
+        TestLLM.toolCall("call-move", "echo", { text: "moving" }),
+        TestLLM.text("Done", "text-after-move"),
+      )
       const tools = yield* s.blockTools()
       const run = yield* s.resume.pipe(Effect.forkChild)
       yield* tools.started
@@ -5470,6 +5473,8 @@ describe("SessionRunnerLLM", () => {
       ]),
     ])
     const assistant = requireAssistant(context)
+    // A tool that records nothing while running still fails without content.
+    expect(assistant.content.find((item) => item.type === "tool")?.state).not.toHaveProperty("content")
     expect(yield* recordedStepSettlementTypes(sessionID, assistant.id)).toEqual([
       "session.step.started.1",
       "session.tool.called.1",
@@ -5487,6 +5492,62 @@ describe("SessionRunnerLLM", () => {
     yield* s.llm.push([])
     yield* s.resume
     expect(messageRoles(s.requests[0])).toEqual(["user", "assistant", "tool"])
+  })
+
+  scenario("sends the logs and calls of an interrupted execute with its failure", function* (s) {
+    const registry = yield* Tool.Service
+    const waiting = yield* Deferred.make<void>()
+    yield* transformTools(registry, {
+      lookup: {
+        name: "lookup",
+        description: "Look up a value",
+        input: Schema.Struct({}),
+        output: Schema.String,
+        execute: () => Effect.succeed({ output: "cached result" }),
+      },
+      wait: {
+        name: "wait",
+        description: "Wait until interrupted",
+        input: Schema.Struct({}),
+        output: Schema.String,
+        execute: () => Deferred.succeed(waiting, undefined).pipe(Effect.andThen(Effect.never)),
+      },
+    })
+    yield* s.admit("Interrupt execute")
+    yield* s.llm.push(
+      TestLLM.hangAfter(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({
+          id: "call-execute",
+          name: "execute",
+          input: { code: 'console.log("checked the cache"); await tools.lookup({}); await tools.wait({})' },
+        }),
+      ),
+    )
+
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Deferred.await(waiting)
+    yield* s.session.interrupt(sessionID)
+    expect(yield* Fiber.await(run)).toMatchObject({ _tag: "Failure" })
+
+    const error = { type: "aborted", message: "Tool execution interrupted" }
+    const content = [
+      Expected.text(
+        "Execution was interrupted.\n\nLogs:\nchecked the cache\n\nTool calls:\n- lookup: completed\n- wait: interrupted",
+      ),
+    ]
+    expect(yield* s.context).toMatchObject([
+      Expected.user("Interrupt execute"),
+      Expected.assistant({}, [Expected.failedTool({ id: "call-execute" }, { error, content })]),
+    ])
+
+    s.requests.length = 0
+    yield* s.llm.push([])
+    yield* s.resume
+    expect(s.requests[0]?.messages.at(-1)).toMatchObject({
+      role: "tool",
+      content: [{ type: "tool-result", id: "call-execute", result: { type: "error", value: { error, content } } }],
+    })
   })
 
   scenario("interrupts a blocked step without local tool execution", function* (s) {

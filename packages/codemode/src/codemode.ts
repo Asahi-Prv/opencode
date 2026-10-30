@@ -65,11 +65,21 @@ export type Environment<Provided extends Record<string, unknown>, Extensions ext
 export type ExecuteOptions<
   Provided extends Record<string, unknown> = {},
   Extensions extends ReadonlyArray<Extension> = [],
-> = Options<Provided, Extensions> & {
-  /** Source for one program in the supported JavaScript subset. */
-  code: string
+> = Options<Provided, Extensions> &
+  RunOptions & {
+    /** Source for one program in the supported JavaScript subset. */
+    code: string
+  }
+
+/** Options for one run of a program. */
+export type RunOptions = {
   /** Read-only JSON values bound in the program's outer global scope (shadowable by top-level declarations). */
   bindings?: Readonly<Record<string, DataValue>>
+  /**
+   * Stops the program when it completes. Running calls are interrupted, and the execution returns an `Interrupted`
+   * failure with the logs and calls so far instead of being interrupted itself.
+   */
+  stop?: Effect.Effect<void>
 }
 
 /** A JSON value that can cross the confined interpreter boundary. */
@@ -90,9 +100,10 @@ export const DiagnosticKind = Schema.Literals([
   "TimeoutExceeded",
   "ToolFailure",
   "ExecutionFailure",
+  "Interrupted",
   "Truncated",
 ])
-/** Stable categories produced by program, schema, tool, limit, and truncation diagnostics. */
+/** Stable categories produced by program, schema, tool, limit, stop, and truncation diagnostics. */
 export type DiagnosticKind = typeof DiagnosticKind.Type
 
 export const Diagnostic = Schema.Struct({
@@ -134,7 +145,7 @@ export type Result = typeof Result.Type
 /** Reusable confined runtime over explicit tools. */
 export type Runtime<R = never> = {
   readonly catalog: ReadonlyArray<ToolDescription>
-  readonly execute: (code: string, bindings?: Readonly<Record<string, DataValue>>) => Effect.Effect<Result, never, R>
+  readonly execute: (code: string, options?: RunOptions) => Effect.Effect<Result, never, R>
 }
 
 const validateLimit = (name: keyof ExecutionLimits, value: number | undefined, minimum: number): number | undefined => {
@@ -156,7 +167,7 @@ export const execute = <
   const Extensions extends ReadonlyArray<Extension> = [],
 >(
   options: ExecuteOptions<Provided, Extensions>,
-): Effect.Effect<Result, never, Environment<Provided, Extensions>> => make(options).execute(options.code, options.bindings)
+): Effect.Effect<Result, never, Environment<Provided, Extensions>> => make(options).execute(options.code, options)
 
 /** Creates an Effect-native runtime over explicit, schema-described tools and extensions. */
 export const make = <
@@ -181,10 +192,17 @@ export const make = <
     get catalog() {
       return prepared.catalog
     },
-    execute: (code, bindings) =>
-      executeProgram(code, prepared, limits, options.hooks ?? {}, (ctx) => [
-        ...Object.entries(bindings ?? {}).map(([name, value]) => [name, fromJson(ctx, value)] as const),
-        ...extensionGlobals(ctx, extensions),
-      ]),
+    execute: (code, run) =>
+      executeProgram(
+        code,
+        prepared,
+        limits,
+        options.hooks ?? {},
+        (ctx) => [
+          ...Object.entries(run?.bindings ?? {}).map(([name, value]) => [name, fromJson(ctx, value)] as const),
+          ...extensionGlobals(ctx, extensions),
+        ],
+        run?.stop,
+      ),
   }
 }
