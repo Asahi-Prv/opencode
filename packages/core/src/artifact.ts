@@ -1,5 +1,6 @@
 export * as Artifact from "./artifact.js"
 
+import { randomUUID } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { lookup } from "mime-types"
@@ -21,6 +22,7 @@ import { Clock, Context, Effect, Layer, Option, Schema } from "effect"
 import { Bus } from "./bus.js"
 import { Config } from "./config.js"
 import { KV } from "./kv.js"
+import { Location } from "./location.js"
 import { Mime } from "./mime.js"
 import { Session } from "./session.js"
 import { State } from "./state.js"
@@ -177,9 +179,26 @@ export interface Interface extends State.Transformable<Editor> {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Artifact") {}
 
-const decodeStoredInfo = Schema.decodeUnknownOption(Info)
-const encodeStoredInfo = Schema.encodeSync(Info)
+const StoredRecord = Schema.Struct({
+  info: Info,
+  directory: Schema.String,
+  projectID: Schema.String,
+})
+type StoredRecord = typeof StoredRecord.Type
+
+const decodeStoredRecord = Schema.decodeUnknownOption(StoredRecord)
+const encodeStoredRecord = Schema.encodeSync(StoredRecord)
 const encoder = new TextEncoder()
+
+/** Resolves the stored directory of an artifact for HTTP routes without an explicit location query. */
+export const locate = (kv: KV.Interface, id: ID) =>
+  kv.get(ItemPrefix + id).pipe(
+    Effect.map((stored) => {
+      if (stored === undefined) return undefined
+      const decoded = decodeStoredRecord(stored)
+      return Option.isSome(decoded) ? decoded.value.directory : undefined
+    }),
+  )
 
 const layer = Layer.effect(
   Service,
@@ -188,6 +207,7 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     const global = yield* Global.Service
     const kv = yield* KV.Service
+    const location = yield* Location.Service
     const sessions = yield* Session.Service
 
     const rootDir = path.join(global.data, "artifacts")
@@ -301,7 +321,7 @@ const layer = Layer.effect(
       list: Effect.fn("Artifact.list")(function* (filter) {
         yield* requireEnabled()
         if (filter?.sessionID !== undefined) yield* checkSession(filter.sessionID)
-        const items = yield* scanAllInfos(kv)
+        const items = yield* scanProjectInfos(kv, location.project.id)
         return items
           .filter(
             (item) =>
@@ -332,60 +352,77 @@ const layer = Layer.effect(
           url: created.url ?? `/api/experimental/artifacts/${encodeURIComponent(id)}/view/`,
           time: { created: now, updated: now },
         })
-        yield* kv.set(ItemPrefix + id, encodeStoredInfo(info))
+        yield* kv.set(
+          ItemPrefix + id,
+          encodeStoredRecord({
+            info,
+            directory: location.directory,
+            projectID: location.project.id,
+          }),
+        )
         return info
       }),
       info: Effect.fn("Artifact.info")(function* (id) {
         yield* requireEnabled()
-        const existing = yield* loadInfo(kv, id)
+        const existing = yield* loadProjectRecord(kv, id, location.project.id)
         if (!existing) return yield* new NotFoundError({ artifactID: id })
-        return existing
+        return existing.info
       }),
       get: Effect.fn("Artifact.get")(function* (id) {
         yield* requireEnabled()
-        const existing = yield* loadInfo(kv, id)
+        const existing = yield* loadProjectRecord(kv, id, location.project.id)
         if (!existing) return yield* new NotFoundError({ artifactID: id })
-        const provider = yield* resolveProvider(existing.provider)
+        const provider = yield* resolveProvider(existing.info.provider)
         const raw = yield* provider
           .read(id)
           .pipe(Effect.mapError((cause) => new ProviderError({ providerID: provider.id, cause })))
         return Content.make({
-          info: existing,
+          info: existing.info,
           files: decodeReadFiles(raw),
         })
       }),
       update: Effect.fn("Artifact.update")(function* (id, input) {
         yield* requireEnabled()
         yield* checkSession(input.sessionID)
-        const existing = yield* loadInfo(kv, id)
+        const existing = yield* loadProjectRecord(kv, id, location.project.id)
         if (!existing) return yield* new NotFoundError({ artifactID: id })
-        const title = input.title === undefined ? existing.title : input.title.trim()
+        const title = input.title === undefined ? existing.info.title : input.title.trim()
         if (!title) return yield* new InvalidError({ reason: "Artifact title must not be empty", field: "title" })
         const files = yield* normalizeFiles(encodeStringFiles(input.files))
-        const entry = yield* resolveEntry(files, input.entry ?? (files[existing.entry] ? existing.entry : undefined))
-        const provider = yield* resolveProvider(existing.provider)
+        const entry = yield* resolveEntry(
+          files,
+          input.entry ?? (files[existing.info.entry] ? existing.info.entry : undefined),
+        )
+        const provider = yield* resolveProvider(existing.info.provider)
         const now = yield* Clock.currentTimeMillis
-        const sessionID = input.sessionID ?? existing.sessionID
+        const sessionID = input.sessionID ?? existing.info.sessionID
         const updated = yield* provider
           .update(id, { title, entry, files, sessionID })
           .pipe(Effect.mapError((cause) => new ProviderError({ providerID: provider.id, cause })))
         const info = Info.make({
           id,
-          provider: existing.provider,
+          provider: existing.info.provider,
           ...(sessionID === undefined ? {} : { sessionID }),
           title,
           entry,
-          url: updated.url ?? existing.url,
-          time: { created: existing.time.created, updated: now },
+          url: updated.url ?? existing.info.url,
+          time: { created: existing.info.time.created, updated: now },
         })
-        yield* kv.set(ItemPrefix + id, encodeStoredInfo(info))
+        yield* kv.set(
+          ItemPrefix + id,
+          encodeStoredRecord({
+            info,
+            directory: existing.directory,
+            projectID: existing.projectID,
+          }),
+        )
         return info
       }),
       remove: Effect.fn("Artifact.remove")(function* (id) {
         yield* requireEnabled()
-        const existing = yield* loadInfo(kv, id)
+        const existing = yield* loadProjectRecord(kv, id, location.project.id)
         if (!existing) return yield* new NotFoundError({ artifactID: id })
-        const provider = state.get().providers.get(existing.provider)
+        const provider = state.get().providers.get(existing.info.provider)
         if (provider) {
           yield* provider
             .delete(id)
@@ -395,15 +432,15 @@ const layer = Layer.effect(
       }),
       readLocalFile: Effect.fn("Artifact.readLocalFile")(function* (id, subpath) {
         yield* requireEnabled()
-        const existing = yield* loadInfo(kv, id)
+        const existing = yield* loadProjectRecord(kv, id, location.project.id)
         if (!existing) return yield* new NotFoundError({ artifactID: id })
-        if (existing.provider !== LocalProviderID) {
+        if (existing.info.provider !== LocalProviderID) {
           return yield* new InvalidError({
-            reason: `Artifact ${id} is hosted by provider "${existing.provider}", not the local server`,
+            reason: `Artifact ${id} is hosted by provider "${existing.info.provider}", not the local server`,
             field: "artifactID",
           })
         }
-        const requested = subpath?.trim() ? yield* normalizePath(subpath) : existing.entry
+        const requested = subpath?.trim() ? yield* normalizePath(subpath) : existing.info.entry
         const target = path.join(itemDir(id), ...requested.split("/"))
         const exists = yield* Effect.promise(() =>
           fs
@@ -422,7 +459,7 @@ const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Bus.node, Config.node, Global.node, KV.node, Session.node],
+  deps: [Bus.node, Config.node, Global.node, KV.node, Location.node, Session.node],
 })
 
 function encodeStringFiles(files: Readonly<Record<string, string>>) {
@@ -495,13 +532,17 @@ function resolveEntry(files: Readonly<Record<string, Uint8Array>>, requested?: s
   )
 }
 
-function loadInfo(kv: KV.Interface, id: ID) {
+function loadProjectRecord(kv: KV.Interface, id: ID, projectID: string) {
   return kv.get(ItemPrefix + id).pipe(
-    Effect.map((stored) => (stored === undefined ? undefined : Option.getOrUndefined(decodeStoredInfo(stored)))),
+    Effect.map((stored) => {
+      if (stored === undefined) return undefined
+      const decoded = Option.getOrUndefined(decodeStoredRecord(stored))
+      return decoded?.projectID === projectID ? decoded : undefined
+    }),
   )
 }
 
-function scanAllInfos(kv: KV.Interface) {
+function scanProjectInfos(kv: KV.Interface, projectID: string) {
   return Effect.gen(function* () {
     const results: Info[] = []
     let after: string | undefined
@@ -509,8 +550,8 @@ function scanAllInfos(kv: KV.Interface) {
       const page = yield* kv.scan({ prefix: ItemPrefix, after, limit: 500 })
       results.push(
         ...page.entries.flatMap((entry) => {
-          const decoded = decodeStoredInfo(entry.value)
-          return Option.isSome(decoded) ? [decoded.value] : []
+          const decoded = decodeStoredRecord(entry.value)
+          return Option.isSome(decoded) && decoded.value.projectID === projectID ? [decoded.value.info] : []
         }),
       )
       if (!page.next) return results
@@ -520,16 +561,37 @@ function scanAllInfos(kv: KV.Interface) {
 }
 
 function replaceDirectoryFiles(baseDir: string, files: Readonly<Record<string, Uint8Array>>) {
-  return Effect.promise(async () => {
-    await fs.rm(baseDir, { recursive: true, force: true })
-    await fs.mkdir(baseDir, { recursive: true })
-    await Promise.all(
-      Object.entries(files).map(async ([rel, bytes]) => {
-        const dest = path.join(baseDir, ...rel.split("/"))
-        await fs.mkdir(path.dirname(dest), { recursive: true })
-        await fs.writeFile(dest, bytes)
-      }),
-    )
+  return Effect.tryPromise(async () => {
+    const parent = path.dirname(baseDir)
+    await fs.mkdir(parent, { recursive: true })
+    const nonce = randomUUID()
+    const staging = `${baseDir}.staging-${nonce}`
+    const backup = `${baseDir}.backup-${nonce}`
+    try {
+      await fs.mkdir(staging, { recursive: true })
+      await Promise.all(
+        Object.entries(files).map(async ([rel, bytes]) => {
+          const dest = path.join(staging, ...rel.split("/"))
+          await fs.mkdir(path.dirname(dest), { recursive: true })
+          await fs.writeFile(dest, bytes)
+        }),
+      )
+      const hadExisting = await fs
+        .stat(baseDir)
+        .then(() => true)
+        .catch(() => false)
+      if (hadExisting) await fs.rename(baseDir, backup)
+      try {
+        await fs.rename(staging, baseDir)
+      } catch (err) {
+        if (hadExisting) await fs.rename(backup, baseDir).catch(() => undefined)
+        throw err
+      }
+      if (hadExisting) await fs.rm(backup, { recursive: true, force: true }).catch(() => undefined)
+    } catch (err) {
+      await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined)
+      throw err
+    }
   })
 }
 

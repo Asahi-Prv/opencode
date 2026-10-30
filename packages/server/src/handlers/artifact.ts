@@ -12,22 +12,33 @@ import {
   ProviderNotFoundError,
   ServiceUnavailableError,
 } from "@opencode/protocol/errors"
-import { Effect, Option, Schema } from "effect"
+import { Effect } from "effect"
 import { type HttpServerRequest, HttpServerResponse } from "effect/http"
 import { HttpApiSchema } from "effect/http-api"
 import { awaitPlugins, locationErrors, requestRef, response } from "../location"
 import { missingSession } from "./session-error"
-
-const StoredSessionRef = Schema.Struct({
-  sessionID: Schema.optional(Session.ID),
-})
-const decodeStoredSessionRef = Schema.decodeUnknownOption(StoredSessionRef)
 
 /** `artifacts.*` in the `server.experimental` group. Every route needs experimental.artifacts in the resolved Location. */
 export const makeArtifact = Effect.gen(function* () {
   const locations = yield* LocationServiceMap.Service
   const sessions = yield* Session.Service
   const kv = yield* KV.Service
+
+  const explicitDirectory = (
+    request: HttpServerRequest.HttpServerRequest,
+    location?: { readonly directory?: string; readonly workspace?: string },
+  ) => {
+    if (location?.directory !== undefined) return location.directory
+    const query = new URL(request.url, "http://localhost").searchParams.get("location[directory]")
+    if (query) return query
+    const header = request.headers["x-opencode-directory"]
+    if (!header) return undefined
+    try {
+      return decodeURIComponent(header)
+    } catch {
+      return header
+    }
+  }
 
   const resolveLocation = (
     request: HttpServerRequest.HttpServerRequest,
@@ -38,20 +49,18 @@ export const makeArtifact = Effect.gen(function* () {
     },
   ) =>
     Effect.gen(function* () {
-      if (options.location?.directory !== undefined) {
-        return Location.Ref.make({ directory: AbsolutePath.make(options.location.directory) })
+      const requestedDir = explicitDirectory(request, options.location)
+      if (requestedDir !== undefined) {
+        return Location.Ref.make({ directory: AbsolutePath.make(requestedDir) })
       }
       if (options.sessionID !== undefined) {
         const session = yield* sessions.get(options.sessionID).pipe(Effect.mapError(missingSession))
         return session.location
       }
       if (options.artifactID !== undefined) {
-        const raw = yield* kv.get(`artifact:item:${options.artifactID}`)
-        const parsed = raw === undefined ? Option.none() : decodeStoredSessionRef(raw)
-        const linkedSessionID = Option.isSome(parsed) ? parsed.value.sessionID : undefined
-        if (linkedSessionID !== undefined) {
-          const found = yield* sessions.get(linkedSessionID).pipe(Effect.option)
-          if (Option.isSome(found)) return found.value.location
+        const directory = yield* Artifact.locate(kv, options.artifactID)
+        if (directory !== undefined) {
+          return Location.Ref.make({ directory: AbsolutePath.make(directory) })
         }
       }
       return requestRef(request)
@@ -208,7 +217,9 @@ export const makeArtifact = Effect.gen(function* () {
             status: 200,
             contentType: file.mime,
             headers: {
+              "access-control-allow-origin": "*",
               "cache-control": "private, no-cache",
+              "content-security-policy": "sandbox allow-scripts",
               "x-content-type-options": "nosniff",
             },
           })

@@ -20,11 +20,12 @@ it.live("manages local and plugin-backed artifacts through /api/experimental/art
     const dir = (yield* tmpdirScoped("opencode-artifact-api-")).path
     const global = path.join(dir, "global")
     const enabled = path.join(dir, "enabled")
+    const enabledOther = path.join(dir, "enabled-other")
     const disabled = path.join(dir, "disabled")
     const pluginDir = path.join(dir, "custom-artifact-plugin")
 
     yield* Effect.promise(async () => {
-      await Promise.all([global, enabled, disabled, pluginDir].map((item) => fs.mkdir(item, { recursive: true })))
+      await Promise.all([global, enabled, enabledOther, disabled, pluginDir].map((item) => fs.mkdir(item, { recursive: true })))
       await fs.writeFile(
         path.join(pluginDir, "package.json"),
         JSON.stringify({ name: "custom-artifact-plugin", type: "module", exports: "./index.js" }),
@@ -69,6 +70,12 @@ export default {
         path.join(enabled, "opencode.json"),
         JSON.stringify({
           plugins: [{ package: pluginDir }],
+          experimental: { artifacts: true },
+        }),
+      )
+      await fs.writeFile(
+        path.join(enabledOther, "opencode.json"),
+        JSON.stringify({
           experimental: { artifacts: true },
         }),
       )
@@ -123,13 +130,36 @@ export default {
       expect(redirect.status).toBe(308)
       expect(redirect.headers.get("location")).toBe(`/api/experimental/artifacts/${created.data.id}/view/`)
 
-      // Serves entry HTML and relative JS without requiring location query when linked to session
+      // Serves entry HTML and relative JS in a sandboxed opaque origin without requiring location query
       const v1Html = await handler(
         new Request(`http://opencode.local/api/experimental/artifacts/${created.data.id}/view/`),
       )
       expect(v1Html.status).toBe(200)
       expect(v1Html.headers.get("content-type")).toContain("text/html")
+      expect(v1Html.headers.get("content-security-policy")).toBe("sandbox allow-scripts")
       expect(await v1Html.text()).toContain("<h1>v1</h1>")
+
+      // Sessionless SDK artifact also resolves its stored directory at /view/
+      const sessionless = await api.experimental.artifacts.create({
+        location: { directory: enabled },
+        title: "Standalone report",
+        files: { "index.html": "<h1>no-session</h1>" },
+      })
+      const sessionlessHtml = await handler(
+        new Request(`http://opencode.local${sessionless.data.url}`),
+      )
+      expect(sessionlessHtml.status).toBe(200)
+      expect(await sessionlessHtml.text()).toContain("<h1>no-session</h1>")
+
+      // Another enabled project cannot list, read, update, or delete this project's artifacts
+      const otherList = await api.experimental.artifacts.list({ location: { directory: enabledOther } })
+      expect(otherList.data).toEqual([])
+      await expect(
+        api.experimental.artifacts.get({ artifactID: created.data.id, location: { directory: enabledOther } }),
+      ).rejects.toMatchObject({ _tag: "ArtifactNotFoundError" })
+      await expect(
+        api.experimental.artifacts.delete({ artifactID: created.data.id, location: { directory: enabledOther } }),
+      ).rejects.toMatchObject({ _tag: "ArtifactNotFoundError" })
 
       const v1Js = await handler(
         new Request(`http://opencode.local/api/experimental/artifacts/${created.data.id}/view/assets/app.js`),
