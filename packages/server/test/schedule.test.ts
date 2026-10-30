@@ -6,6 +6,7 @@ import { Effect } from "effect"
 import { tmpdirScoped } from "../../core/test/fixture/tmpdir"
 import { it } from "../../core/test/lib/effect"
 import { ServerFetch } from "../src/fetch"
+import { ServerProcess } from "../src/process"
 import { startServer } from "./fixture/server"
 
 const client = (handler: (request: Request) => Promise<Response>) =>
@@ -171,6 +172,53 @@ it.live("ticks due schedules in standalone ServerProcess.start without lifecycle
         status: "done",
         lastOutcome: "checked",
       })
+    })
+  }).pipe(Effect.scoped),
+)
+
+it.live("elects one scheduler leader across two server processes sharing a database", () =>
+  Effect.gen(function* () {
+    const dir = (yield* tmpdirScoped("opencode-schedule-leader-")).path
+    const dbPath = path.join(dir, "shared.db")
+    const marker = path.join(dir, "runs.txt")
+    const boot = () =>
+      ServerProcess.start<never, never>({
+        hostname: "127.0.0.1",
+        port: 0,
+        password: "secret",
+        app: { version: "test-version" },
+        database: { path: dbPath },
+        config: { directory: dir },
+        fs: { filewatcher: false },
+        models: { fetch: false },
+      })
+    const first = yield* boot()
+    yield* boot()
+    const base = `http://127.0.0.1:${"port" in first.address ? first.address.port : 0}`
+    const api = OpenCode.make({
+      baseUrl: base,
+      headers: { authorization: `Basic ${btoa("opencode:secret")}` },
+    })
+
+    yield* Effect.promise(async () => {
+      await fs.writeFile(path.join(dir, "opencode.json"), JSON.stringify({ permission: { shell: "allow" } }))
+      const session = await api.session.create({ location: { directory: dir } })
+      const created = await api.experimental.schedule.create({
+        sessionID: session.id,
+        when: { in: "200 millis" },
+        if: { run: `printf 'x\\n' >> ${JSON.stringify(marker)} && false` },
+        prompt: "single leader check",
+      })
+      const deadline = Date.now() + 5_000
+      let current = created
+      while (current.status === "active" && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        current = await api.experimental.schedule.get({ scheduleID: created.id })
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      const lines = (await fs.readFile(marker, "utf8")).trim().split("\n").filter(Boolean)
+      expect(current.status).toBe("done")
+      expect(lines).toEqual(["x"])
     })
   }).pipe(Effect.scoped),
 )
