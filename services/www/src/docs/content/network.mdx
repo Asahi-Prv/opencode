@@ -104,11 +104,12 @@ fetched page cannot use the machine's identity.
   Give the path itself, not a `{file:...}` reference, which would put the passphrase into the configuration.
 - The last entry whose `hosts` match is used, so list broad patterns first and specific hosts after them.
 
-This is a machine setting, so OpenCode reads it only from managed and global configuration: macOS managed preferences
-(`ai.opencode.managed`), the system directory (`/etc/opencode`, `/Library/Application Support/opencode`,
-`%ProgramData%\opencode`), and the global `~/.config/opencode/opencode.json(c)`. The highest-ranked of these that sets
-`network.client_certificates` replaces the others, and `network` in project configuration is ignored. Changes apply
-within a minute.
+The certificate is the machine's identity, so a repository cannot choose where it is presented: `network` in project
+`opencode.json(c)` and `.opencode/` files is ignored with a warning. Every other source applies with the usual
+[precedence](/config#locations), so managed preferences (`ai.opencode.managed`) and the system directory
+(`/etc/opencode`, `/Library/Application Support/opencode`, `%ProgramData%\opencode`) override the global
+`~/.config/opencode/opencode.json(c)`. The highest-ranked source that sets `network.client_certificates` replaces the
+others, and changes apply like any other configuration.
 
 Requests that present a client certificate do not follow redirects, because a redirect would present it to the host the
 server names. They also fail when an `https://` proxy applies, because the proxy's own TLS handshake would receive the

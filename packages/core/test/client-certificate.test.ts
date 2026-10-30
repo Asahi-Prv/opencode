@@ -6,6 +6,9 @@ import { ConfigNetwork } from "@opencode/schema/config/network"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http"
 import { RequestExecutor } from "@opencode/ai/route"
 import { ClientCertificate } from "@opencode/core/client-certificate"
+import { Config } from "@opencode/core/config"
+import { AbsolutePath } from "@opencode/core/schema"
+import { Document, Info } from "@opencode/schema/config"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNodePlatform } from "@opencode/core/effect/app-node-platform"
 import { httpClient } from "@opencode/util/effect/app-node-platform"
@@ -25,11 +28,9 @@ let server: Bun.Server<undefined>
 
 beforeAll(async () => {
   root = await tmpdir()
-  await fs.mkdir(path.join(root.path, "system"))
-  await fs.mkdir(path.join(root.path, "global"))
   if (!Bun.which("openssl")) return
   const certs = path.join(root.path, "system", "certs")
-  await fs.mkdir(certs)
+  await fs.mkdir(certs, { recursive: true })
   const openssl = (...args: string[]) =>
     Bun.$`openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 2 ${args}`.cwd(certs).quiet()
   await openssl("-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-subj", "/CN=OpenCode Test CA")
@@ -67,24 +68,31 @@ afterAll(async () => {
   await root[Symbol.asyncDispose]()
 })
 
-const write = (directory: string, config: unknown) =>
-  Effect.promise(() => Bun.write(path.join(root.path, directory, "opencode.json"), JSON.stringify(config)))
+const document = (directory: string, config: unknown) =>
+  new Document({
+    type: "document",
+    path: AbsolutePath.make(path.join(root.path, directory, "opencode.json")),
+    info: Schema.decodeUnknownSync(Info)(config),
+  })
+
+/** The Location config a model request runs with. */
+const configured = (...documents: Document[]) => Effect.provide(Config.testLayer(documents))
 
 // The key is encrypted, so a request only succeeds when the passphrase reaches the TLS options too.
-const certificate = (hosts: string[]) => ({
-  network: {
-    client_certificates: [
-      { hosts, cert: "certs/client.pem", key: "certs/client.key", passphrase_file: "certs/passphrase" },
-    ],
-  },
-})
+const certificate = (hosts: string[]) =>
+  document("system", {
+    network: {
+      client_certificates: [
+        { hosts, cert: "certs/client.pem", key: "certs/client.key", passphrase_file: "certs/passphrase" },
+      ],
+    },
+  })
+
+const global = () => ({ config: path.join(root.path, "global"), home: path.join(root.path, "home") })
 
 const layer = () =>
-  AppNodeBuilder.build(LayerNode.group([LayerNodePlatform.requestExecutor, httpClient, ClientCertificate.node]), [
-    ClientCertificate.node.replace(ClientCertificate.configured({ system: path.join(root.path, "system") })),
-    Global.node.replace(
-      Global.layerWith({ config: path.join(root.path, "global"), home: path.join(root.path, "home") }),
-    ),
+  AppNodeBuilder.build(LayerNode.group([LayerNodePlatform.requestExecutor, httpClient]), [
+    Global.node.replace(Global.layerWith(global())),
   ])
 
 // The test CA only verifies the server; trust for real gateways comes from the system store or NODE_EXTRA_CA_CERTS.
@@ -121,25 +129,22 @@ describe("ClientCertificate", () => {
   })
 
   itWithOpenSSL("presents the certificate to a matching host", () =>
-    Effect.gen(function* () {
-      yield* write("system", certificate(["LOCALHOST"]))
-      expect(yield* get("localhost")).toBe("ok")
-    }).pipe(Effect.provide(layer())),
+    get("localhost").pipe(
+      configured(certificate(["LOCALHOST"])),
+      Effect.map((body) => expect(body).toBe("ok")),
+      Effect.provide(layer()),
+    ),
   )
 
   itWithOpenSSL("does not present the certificate to other hosts", () =>
-    Effect.gen(function* () {
-      yield* write("system", certificate(["localhost"]))
-      expect(yield* Effect.flip(get("127.0.0.1"))).toBeDefined()
-    }).pipe(Effect.provide(layer())),
+    Effect.flip(get("127.0.0.1")).pipe(configured(certificate(["localhost"])), Effect.provide(layer())),
   )
 
   itWithOpenSSL("does not present the certificate on requests other than model requests", () =>
     Effect.gen(function* () {
-      yield* write("system", certificate(["localhost"]))
       const client = yield* HttpClient.HttpClient
-      expect(yield* Effect.flip(client.get(`https://localhost:${server.port}/`).pipe(trusted))).toBeDefined()
-    }).pipe(Effect.provide(layer())),
+      return yield* Effect.flip(client.get(`https://localhost:${server.port}/`).pipe(trusted))
+    }).pipe(configured(certificate(["localhost"])), Effect.provide(layer())),
   )
 
   it.live("refuses to send the certificate through an HTTPS proxy", () =>
@@ -152,69 +157,60 @@ describe("ClientCertificate", () => {
         no_proxy: undefined,
       },
       () =>
-        Effect.gen(function* () {
-          yield* write("system", certificate(["llm.corp.test"]))
-          const error = yield* Effect.flip(get("llm.corp.test"))
-          expect(String(error)).toContain("NO_PROXY")
-        }),
+        Effect.flip(get("llm.corp.test")).pipe(
+          configured(certificate(["llm.corp.test"])),
+          Effect.map((error) => expect(String(error)).toContain("NO_PROXY")),
+        ),
     ).pipe(Effect.provide(layer())),
   )
 
   itWithOpenSSL("fails instead of following a redirect with the certificate", () =>
-    Effect.gen(function* () {
-      yield* write("system", certificate(["localhost", "127.0.0.1"]))
-      const error = yield* Effect.flip(get("localhost", "/redirect"))
-      expect(String(error.cause)).toContain("Redirect")
-    }).pipe(Effect.provide(layer())),
+    Effect.flip(get("localhost", "/redirect")).pipe(
+      configured(certificate(["localhost", "127.0.0.1"])),
+      Effect.map((error) => expect(String(error.cause)).toContain("Redirect")),
+      Effect.provide(layer()),
+    ),
   )
 
-  it.live("lets system configuration replace the user's certificates", () =>
-    Effect.gen(function* () {
-      yield* write("global", {
-        network: { client_certificates: [{ hosts: ["user.test"], cert: "~/user.pem", key: "user.key" }] },
-      })
-      yield* write("system", {
-        network: {
-          client_certificates: [
-            { hosts: ["*.corp.test", "[0:0:0:0:0:0:0:1]"], cert: "/etc/corp.pem", key: "corp.key" },
-          ],
-        },
-      })
-      const certificates = yield* ClientCertificate.Service
-      const rules = yield* certificates.rules()
-      expect(rules).toEqual([
-        {
-          hosts: ["*.corp.test", "[::1]"],
-          cert: path.resolve(root.path, "/etc/corp.pem"),
-          key: path.join(root.path, "system", "corp.key"),
-          passphraseFile: undefined,
-        },
-      ])
-      expect(ClientCertificate.match(rules, "https://api.corp.test/v1")).toBe(rules[0])
-      expect(ClientCertificate.match(rules, "https://API.corp.test./v1")).toBe(rules[0])
-      expect(ClientCertificate.match(rules, "https://[::1]/")).toBe(rules[0])
-      expect(ClientCertificate.match(rules, "http://api.corp.test/v1")).toBeUndefined()
-      expect(ClientCertificate.match(rules, "https://user.test/v1")).toBeUndefined()
-      const specific = { ...rules[0], hosts: ["llm.corp.test"] }
-      expect(ClientCertificate.match([...rules, specific], "https://llm.corp.test/v1")).toBe(specific)
-    }).pipe(Effect.provide(layer())),
-  )
-
-  it.live("resolves the user's certificates when no system configuration sets any", () =>
-    Effect.gen(function* () {
-      yield* write("global", {
-        network: { client_certificates: [{ hosts: ["user.test"], cert: "~/user.pem", key: "user.key" }] },
-      })
-      yield* write("system", {})
-      const certificates = yield* ClientCertificate.Service
-      expect(yield* certificates.rules()).toEqual([
-        {
-          hosts: ["user.test"],
-          cert: path.join(root.path, "home", "user.pem"),
-          key: path.join(root.path, "global", "user.key"),
-          passphraseFile: undefined,
-        },
-      ])
-    }).pipe(Effect.provide(layer())),
-  )
+  test("takes rules from the highest-ranked document and resolves its paths", () => {
+    const user = document("global", {
+      network: { client_certificates: [{ hosts: ["user.test"], cert: "~/user.pem", key: "user.key" }] },
+    })
+    expect(ClientCertificate.rules([user, document("system", {})], global())).toEqual([
+      {
+        hosts: ["user.test"],
+        cert: path.join(root.path, "home", "user.pem"),
+        key: path.join(root.path, "global", "user.key"),
+        passphraseFile: undefined,
+      },
+    ])
+    const rules = ClientCertificate.rules(
+      [
+        user,
+        document("system", {
+          network: {
+            client_certificates: [
+              { hosts: ["*.corp.test", "[0:0:0:0:0:0:0:1]"], cert: "/etc/corp.pem", key: "corp.key" },
+            ],
+          },
+        }),
+      ],
+      global(),
+    )
+    expect(rules).toEqual([
+      {
+        hosts: ["*.corp.test", "[::1]"],
+        cert: path.resolve(root.path, "/etc/corp.pem"),
+        key: path.join(root.path, "system", "corp.key"),
+        passphraseFile: undefined,
+      },
+    ])
+    expect(ClientCertificate.match(rules, "https://api.corp.test/v1")).toBe(rules[0])
+    expect(ClientCertificate.match(rules, "https://API.corp.test./v1")).toBe(rules[0])
+    expect(ClientCertificate.match(rules, "https://[::1]/")).toBe(rules[0])
+    expect(ClientCertificate.match(rules, "http://api.corp.test/v1")).toBeUndefined()
+    expect(ClientCertificate.match(rules, "https://user.test/v1")).toBeUndefined()
+    const specific = { ...rules[0], hosts: ["llm.corp.test"] }
+    expect(ClientCertificate.match([...rules, specific], "https://llm.corp.test/v1")).toBe(specific)
+  })
 })
