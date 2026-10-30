@@ -74,6 +74,7 @@ test("exposes every standard HTTP API group", () => {
     "wait",
     "instructions",
     "log",
+    "jobs",
   ])
   expect(Object.keys(client.experimental.voice)).toEqual(["models", "session"])
   expect(Object.keys(client.experimental.usage)).toEqual(["limits"])
@@ -158,6 +159,7 @@ test("nests a method under client.experimental exactly when its route is experim
     "session.instructions.entry.list",
     "session.instructions.entry.put",
     "session.instructions.entry.remove",
+    "session.jobs",
     "session.log",
     "session.skill",
     "session.stats",

@@ -1,4 +1,5 @@
 export * as Job from "./job.js"
+export { Event, Status } from "@opencode/schema/job"
 
 import { asc, eq, or } from "drizzle-orm"
 import {
@@ -11,11 +12,14 @@ import {
   Effect,
   Exit,
   Layer,
+  Option,
   Schema,
   Scope,
   SynchronizedRef,
 } from "effect"
+import { Job as JobSchema } from "@opencode/schema/job"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
+import { Bus } from "./bus.js"
 import { Database } from "./database/database.js"
 import { ImageNotice } from "./image/notice.js"
 import { JobTable } from "./job/sql.js"
@@ -63,7 +67,7 @@ const Background = Schema.Struct({
 
 export type Background = typeof Background.Type
 export type Recovery = Background["recovery"]
-export type Status = Background["status"]
+export type PublicInfo = JobSchema.Info
 
 const decodeBackground = Schema.decodeUnknownResult(Background)
 const COMPLETED_LIMIT = 25
@@ -161,7 +165,7 @@ export type Info<Value = unknown> = {
   sessionID?: SessionSchema.ID
   type: string
   title?: string
-  status: Status
+  status: JobSchema.Status
   started_at: number
   completed_at?: number
   output?: string
@@ -285,6 +289,7 @@ export interface Interface {
   readonly backgroundAll: (input: BackgroundAllInput) => Effect.Effect<Info[]>
   readonly cancel: (id: string, options?: CancelOptions) => Effect.Effect<Info | undefined>
   readonly cancelSession: (sessionID: SessionSchema.ID) => Effect.Effect<Info[]>
+  readonly activeSessions: Effect.Effect<ReadonlySet<SessionSchema.ID>>
   readonly registerNotifier: (notifier: Notifier) => Effect.Effect<void>
   readonly pendingBackground: Effect.Effect<readonly Background[]>
   readonly runningBackground: Effect.Effect<readonly Recovery[]>
@@ -297,6 +302,21 @@ function snapshot<Value = unknown>(job: Active): Info<Value> {
   return {
     ...job.info,
     ...(job.info.metadata ? { metadata: { ...job.info.metadata } } : {}),
+  }
+}
+
+function publicSnapshot(info: Info<any>): PublicInfo {
+  return {
+    id: info.id,
+    ...(info.sessionID !== undefined ? { sessionID: info.sessionID } : {}),
+    type: info.type,
+    ...(info.title !== undefined ? { title: info.title } : {}),
+    status: info.status,
+    started_at: info.started_at,
+    ...(info.completed_at !== undefined ? { completed_at: info.completed_at } : {}),
+    ...(info.output !== undefined ? { output: info.output } : {}),
+    ...(info.error !== undefined ? { error: info.error } : {}),
+    ...(info.metadata !== undefined ? { metadata: { ...info.metadata } } : {}),
   }
 }
 
@@ -362,11 +382,20 @@ function decrementSession(input: Map<SessionSchema.ID, number>, sessionID: Sessi
  */
 export const make = Effect.gen(function* () {
   const db = (yield* Database.Service).db
+  const bus = Option.getOrUndefined(yield* Effect.serviceOption(Bus.Service))
   // Outlives any Location or plugin scope that started a job.
   const baseContext = yield* Effect.context<never>()
   const state: State = {
     jobs: yield* SynchronizedRef.make(new Map()),
     scope: yield* Scope.Scope,
+  }
+
+  const publish = (info: Info<any>) => {
+    if (!bus) return Effect.void
+    return bus.publish(JobSchema.Event.Updated, {
+      info: publicSnapshot(info),
+      active: info.status === "running",
+    })
   }
 
   const readLiveOutput = (job: Active) =>
@@ -493,7 +522,7 @@ export const make = Effect.gen(function* () {
         if (!job) return [{}, jobs]
         if (job.scope !== scope) return [{}, jobs]
         if (job.info.status !== "running") return [{ info: snapshot(job) }, jobs]
-        const status: Exclude<Status, "running"> = Exit.isSuccess(exit)
+        const status: Exclude<JobSchema.Status, "running"> = Exit.isSuccess(exit)
           ? "completed"
           : Cause.hasInterruptsOnly(exit.cause)
             ? "cancelled"
@@ -528,6 +557,7 @@ export const make = Effect.gen(function* () {
     )
     if (result.info && result.done) yield* Deferred.succeed(result.done, result.info)
     if (result.deliver) yield* result.deliver()
+    if (result.info) yield* publish(result.info)
     if (result.scope) {
       yield* Scope.close(result.scope, Exit.void).pipe(Effect.forkIn(state.scope, { startImmediately: true }))
     }
@@ -597,13 +627,15 @@ export const make = Effect.gen(function* () {
             return [{ info: snapshot(job), scope }, new Map(jobs).set(input.id, job)]
           }),
         )
-        if ("scope" in result)
+        if ("scope" in result) {
+          yield* publish(result.info)
           yield* restore(input.run).pipe(
             Effect.exit,
             Effect.flatMap((exit) => settle(input.id, result.scope, exit)),
             Effect.asVoid,
             Effect.forkIn(result.scope, { startImmediately: true }),
           )
+        }
         return result.info as Info<Value>
       }),
     )
@@ -671,8 +703,10 @@ export const make = Effect.gen(function* () {
         ]
       }),
     )
-    if (result.info && result.backgrounded)
+    if (result.info && result.backgrounded) {
       yield* Deferred.succeed(result.backgrounded, { info: result.info, reason: result.reason ?? "yield_after" })
+      yield* publish(result.info)
+    }
     return result.info
   })
 
@@ -773,6 +807,7 @@ export const make = Effect.gen(function* () {
     if (result.info && result.backgrounded)
       yield* Deferred.succeed(result.backgrounded, { info: result.info, reason: "signal" as const })
     if (result.deliver) yield* result.deliver()
+    if (result.info) yield* publish(result.info)
     return result.info
   })
 
@@ -807,7 +842,11 @@ export const make = Effect.gen(function* () {
     )
     yield* Effect.forEach(
       result,
-      (item) => Deferred.succeed(item.backgrounded, { info: item.info, reason: "signal" as const }),
+      (item) =>
+        Effect.andThen(
+          Deferred.succeed(item.backgrounded, { info: item.info, reason: "signal" as const }),
+          publish(item.info),
+        ),
       { discard: true },
     )
     return result.map((item) => item.info)
@@ -859,6 +898,7 @@ export const make = Effect.gen(function* () {
     if (result.stop) yield* result.stop.pipe(Effect.setContext(baseContext), Effect.ignoreCause)
     if (result.scope) yield* Scope.close(result.scope, Exit.void)
     if (result.deliver) yield* result.deliver()
+    if (result.info) yield* publish(result.info)
     if (result.generation) yield* consume(id, result.generation)
     return result.info
   })
@@ -882,6 +922,18 @@ export const make = Effect.gen(function* () {
     })
     return cancelled.filter((info): info is Info => info !== undefined)
   })
+
+  const activeSessions: Interface["activeSessions"] = SynchronizedRef.get(state.jobs).pipe(
+    Effect.map(
+      (jobs) =>
+        new Set(
+          [...jobs.values()].flatMap((job) =>
+            job.info.status === "running" && job.info.sessionID !== undefined ? [job.info.sessionID] : [],
+          ),
+        ),
+    ),
+    Effect.withSpan("Job.activeSessions"),
+  )
 
   const registerNotifier: Interface["registerNotifier"] = (notifier) =>
     Effect.sync(() => {
@@ -927,6 +979,7 @@ export const make = Effect.gen(function* () {
     backgroundAll,
     cancel,
     cancelSession,
+    activeSessions,
     registerNotifier,
     pendingBackground,
     runningBackground,
@@ -936,4 +989,4 @@ export const make = Effect.gen(function* () {
 
 const layer = Layer.effect(Service, make)
 
-export const node = makeGlobalNode({ service: Service, layer, deps: [Database.node] })
+export const node = makeGlobalNode({ service: Service, layer, deps: [Database.node, Bus.node] })
